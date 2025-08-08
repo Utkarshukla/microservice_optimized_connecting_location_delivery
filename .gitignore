@@ -307,7 +307,7 @@ dist
 route_map.html
 route_summary.png
 route_timeline.png
-*.html
+
 *.png
 *.jpg
 *.jpeg

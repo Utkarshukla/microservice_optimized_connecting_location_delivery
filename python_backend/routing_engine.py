@@ -14,7 +14,7 @@ class RoutingEngine:
 
     def optimize_route(self, request: Dict[str, Any]) -> RoutingResponse:
         """
-        Main method to optimize delivery route based on the new request format.
+        Main method to optimize delivery route based on time constraints and priorities.
         """
         start_time = time.time()
         
@@ -23,9 +23,25 @@ class RoutingEngine:
         settings = Settings(**request["settings"])
         deliveries = [Delivery(**delivery) for delivery in request["deliveries"]]
         
-        # Prepare data for OR-Tools
+        # Calculate available time for deliveries
+        pickup_start = self.distance_calculator.time_to_minutes(pickup.start_time)
+        pickup_end = self.distance_calculator.time_to_minutes(pickup.end_time)
+        max_delivery_time = pickup_end - pickup_start  # Total available time in minutes
+        
+        # Filter and prioritize deliveries based on time constraints
+        feasible_deliveries, skipped_deliveries = self._select_feasible_deliveries(
+            pickup, deliveries, settings, max_delivery_time
+        )
+        
+        if not feasible_deliveries:
+            return self._create_infeasible_response(
+                pickup, deliveries, time.time() - start_time, 
+                "No deliveries can be completed within the available time window"
+            )
+        
+        # Prepare data for OR-Tools with selected deliveries
         points, distance_matrix, time_matrix, priorities, time_windows = self._prepare_optimization_data(
-            pickup, deliveries, settings
+            pickup, feasible_deliveries, settings
         )
         
         # Create and solve the routing model
@@ -35,20 +51,23 @@ class RoutingEngine:
         
         if solution:
             # Extract route from solution
-            route_stops = self._extract_route(manager, routing, solution, pickup, deliveries, settings, time_matrix)
+            route_stops = self._extract_route(manager, routing, solution, pickup, feasible_deliveries, settings, time_matrix)
             
             # Calculate metrics
             total_distance = self._calculate_total_distance(route_stops, distance_matrix)
             total_time = self._calculate_total_time(route_stops, time_matrix, settings.time_per_stop_minutes)
             
-            # Determine skipped deliveries
-            skipped_deliveries = self._determine_skipped_deliveries(deliveries, route_stops)
+            # Add remaining skipped deliveries from OR-Tools solution
+            additional_skipped = self._determine_skipped_deliveries(feasible_deliveries, route_stops)
+            final_skipped = skipped_deliveries + additional_skipped
             
             optimization_metrics = {
                 "processing_time_seconds": time.time() - start_time,
                 "optimization_method": settings.optimize_by,
                 "total_stops": len(route_stops),
-                "skipped_stops": len(skipped_deliveries)
+                "skipped_stops": len(final_skipped),
+                "available_time_minutes": max_delivery_time,
+                "used_time_minutes": total_time
             }
             
             return RoutingResponse(
@@ -56,12 +75,66 @@ class RoutingEngine:
                 total_distance_km=total_distance,
                 total_time_minutes=total_time,
                 is_feasible=True,
-                skipped_deliveries=skipped_deliveries,
+                skipped_deliveries=final_skipped,
                 optimization_metrics=optimization_metrics
             )
         else:
             # Handle infeasible case
             return self._create_infeasible_response(pickup, deliveries, time.time() - start_time)
+
+    def _select_feasible_deliveries(self, pickup: PickupLocation, deliveries: List[Delivery], 
+                                   settings: Settings, max_delivery_time: int) -> Tuple[List[Delivery], List[Dict]]:
+        """
+        Select deliveries that can be completed within time constraints, prioritizing high-priority orders.
+        """
+        # Sort deliveries by priority (1=high, 2=medium, 3=low)
+        sorted_deliveries = sorted(deliveries, key=lambda d: d.priority.value)
+        
+        selected_deliveries = []
+        skipped_deliveries = []
+        current_time = 0  # Time spent on deliveries so far
+        current_lat, current_lng = pickup.lat, pickup.lng
+        
+        # Reserve time for return to origin
+        return_time_buffer = 10  # minutes buffer for return journey
+        
+        for delivery in sorted_deliveries:
+            # Calculate travel time to this delivery
+            travel_time = self.distance_calculator.calculate_travel_time(
+                self.distance_calculator.calculate_geodesic_distance(
+                    current_lat, current_lng, delivery.lat, delivery.lng
+                )
+            )
+            
+            # Calculate total time needed for this delivery (travel + service)
+            delivery_time = travel_time + settings.time_per_stop_minutes
+            
+            # Calculate return time from this delivery to pickup
+            return_travel_time = self.distance_calculator.calculate_travel_time(
+                self.distance_calculator.calculate_geodesic_distance(
+                    delivery.lat, delivery.lng, pickup.lat, pickup.lng
+                )
+            )
+            
+            # Check if adding this delivery would exceed time limit
+            total_time_needed = current_time + delivery_time + return_travel_time + return_time_buffer
+            
+            if total_time_needed <= max_delivery_time:
+                # Can include this delivery
+                selected_deliveries.append(delivery)
+                current_time += delivery_time
+                current_lat, current_lng = delivery.lat, delivery.lng
+            else:
+                # Skip this delivery due to time constraints
+                reason = f"Time constraint: Would need {total_time_needed:.1f} minutes, but only {max_delivery_time} available"
+                skipped_deliveries.append({
+                    "address": delivery.address,
+                    "zipcode": delivery.zipcode,
+                    "priority": delivery.priority.value,
+                    "reason": reason
+                })
+        
+        return selected_deliveries, skipped_deliveries
 
     def _prepare_optimization_data(self, pickup: PickupLocation, deliveries: List[Delivery], 
                                  settings: Settings) -> Tuple[List[Tuple[float, float]], List[List[float]], 
@@ -262,7 +335,7 @@ class RoutingEngine:
         return skipped_deliveries
 
     def _create_infeasible_response(self, pickup: PickupLocation, deliveries: List[Delivery], 
-                                  processing_time: float) -> RoutingResponse:
+                                  processing_time: float, reason: str = "Route infeasible - time constraints cannot be met") -> RoutingResponse:
         """
         Create response for infeasible route.
         """
@@ -275,10 +348,10 @@ class RoutingEngine:
                 "address": delivery.address,
                 "zipcode": delivery.zipcode,
                 "priority": delivery.priority.value,
-                "reason": "Route infeasible - time constraints cannot be met"
+                "reason": reason
             } for delivery in deliveries],
             optimization_metrics={
                 "processing_time_seconds": processing_time,
-                "error": "No feasible solution found"
+                "error": reason
             }
         ) 
